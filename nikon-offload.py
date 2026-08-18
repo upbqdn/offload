@@ -170,7 +170,12 @@ def db_open(path: Path) -> sqlite3.Connection:
         captured TEXT, serial TEXT,
         local_path TEXT, verified_local INTEGER DEFAULT 0,
         remote_path TEXT, verified_remote INTEGER DEFAULT 0,
-        imported_at TEXT)""")
+        imported_at TEXT,
+        immich_uploaded INTEGER DEFAULT 0)""")
+    # Migration for ledgers created before Immich upload existed.
+    cols = {r[1] for r in db.execute('PRAGMA table_info(asset)')}
+    if 'immich_uploaded' not in cols:
+        db.execute('ALTER TABLE asset ADD COLUMN immich_uploaded INTEGER DEFAULT 0')
     db.commit()
     return db
 
@@ -317,6 +322,36 @@ def probe_one(session: Path) -> int:
     print(f"  size matches the camera's own report ({claimed} bytes)")
     return 0 if ok else 1
 
+
+def immich_upload(files: list[Path], album: str) -> bool:
+    """Upload freshly archived files to Immich via its official CLI.
+
+    Runs only after the files are archived and verified, so Immich is an additional
+    destination rather than the only copy. Credentials come from the environment or
+    ~/.config/nikon-offload/immich.{url,key}; use an API key scoped to asset upload
+    and album management, not an admin key.
+
+    Immich deduplicates by checksum, so re-running is harmless.
+    """
+    cfg = Path.home() / '.config/nikon-offload'
+    url = os.environ.get('IMMICH_INSTANCE_URL') or (
+        (cfg / 'immich.url').read_text().strip() if (cfg / 'immich.url').exists() else '')
+    key = os.environ.get('IMMICH_API_KEY') or (
+        (cfg / 'immich.key').read_text().strip() if (cfg / 'immich.key').exists() else '')
+    if not url or not key:
+        print('  ! Immich upload skipped: set IMMICH_INSTANCE_URL and IMMICH_API_KEY, or write '
+              f'{cfg}/immich.url and immich.key', file=sys.stderr)
+        return False
+    if not shutil.which('npx'):
+        print('  ! Immich upload skipped: npx not found (needs node)', file=sys.stderr)
+        return False
+    env = {**os.environ, 'IMMICH_INSTANCE_URL': url, 'IMMICH_API_KEY': key}
+    proc = subprocess.run(['npx', '-y', '@immich/cli', 'upload', '--no-progress',
+                           '--album-name', album, *map(str, files)], env=env)
+    if proc.returncode != 0:
+        print(f'  ! Immich upload exited {proc.returncode}', file=sys.stderr)
+        return False
+    return True
 
 
 def stage_from_camera(session: Path) -> tuple[list[Path], bool]:
@@ -518,6 +553,9 @@ def main() -> int:
     ap.add_argument('--remote', default=os.environ.get('NIKON_REMOTE', ''),
                     help='host:path for the verified second copy, or $NIKON_REMOTE; '
                          'empty means only one copy exists and the run says so')
+    ap.add_argument('--immich', nargs='?', const='auto', metavar='ALBUM',
+                    help='also upload newly archived files to Immich; ALBUM defaults to '
+                         '"Camera YYYY-MM-DD" per capture day')
     ap.add_argument('--keep-session', action='store_true', help='do not delete the staging dir')
     a = ap.parse_args()
 
@@ -548,6 +586,10 @@ def main() -> int:
 
         new, dupes, failed, days = 0, 0, 0, set()
         unreplicated_dupes = 0
+        # Every digest accounted for by this run, new or already-archived. Immich upload works
+        # from this set against ledger state, so a file whose upload failed on an earlier run is
+        # retried rather than skipped forever as a duplicate.
+        seen: list[str] = []
         for path in staged:
             ok, why = integrity_ok(path)
             if not ok:
@@ -566,6 +608,7 @@ def main() -> int:
                 if prior.exists() and prior.stat().st_size == path.stat().st_size \
                         and sha(prior) == digest:
                     dupes += 1
+                    seen.append(digest)
                     if not row[2]:
                         unreplicated_dupes += 1
                         days.add(prior.parent.name)
@@ -592,6 +635,7 @@ def main() -> int:
                         str(dest), dt.datetime.now().isoformat(timespec='seconds')))
             db.commit()
             new += 1
+            seen.append(digest)
             days.add(day)
 
         print(f"new {new}   duplicates {dupes}   failed {failed}")
@@ -611,6 +655,33 @@ def main() -> int:
             replicated = False
             print('  replication skipped (--remote empty): only one copy exists')
 
+        # Immich last, and only for files already archived and verified, so it is an extra
+        # destination rather than the sole copy. Which files upload is decided by ledger state
+        # over this run's whole inventory, not by what happened to be new this run: an upload
+        # that failed earlier is retried on the next offload of the same card. Grouped by
+        # capture day so albums stay useful.
+        immich_ok = True
+        if a.immich:
+            todo: dict[str, list[Path]] = {}
+            for digest in seen:
+                row = db.execute('SELECT local_path FROM asset WHERE content_hash=? '
+                                 'AND immich_uploaded=0', (digest,)).fetchone()
+                if row and Path(row[0]).exists():
+                    todo.setdefault(Path(row[0]).parent.name, []).append(Path(row[0]))
+            if not todo:
+                print('  immich: already uploaded, nothing to do')
+            for day, paths in sorted(todo.items()):
+                album = f'Camera {day}' if a.immich == 'auto' else a.immich
+                print(f"  immich: uploading {len(paths)} file(s) to '{album}'")
+                if immich_upload(paths, album):
+                    db.executemany('UPDATE asset SET immich_uploaded=1 WHERE local_path=?',
+                                   [(str(p),) for p in paths])
+                    db.commit()
+                else:
+                    immich_ok = False
+                    print(f"  ! immich: {len(paths)} file(s) from {day} not uploaded; rerun to "
+                          "retry", file=sys.stderr)
+
         # Per-run reconciliation over THIS card's inventory, every file type, not a global RAW
         # count. Deliberately no "safe to format" verdict: authorising a destructive action needs
         # a hardware-backed inventory comparison against the camera's own file list, which has
@@ -627,6 +698,11 @@ def main() -> int:
             by_ext[ext] = [vl or 0, vr or 0]
         for ext, (vl, vr) in sorted(by_ext.items()):
             print(f"  archive {ext:>5}: {vl} local-verified, {vr} remote-verified")
+        if a.immich:
+            pend = db.execute('SELECT COUNT(*) FROM asset WHERE immich_uploaded=0 AND '
+                              'content_hash IN (%s)' % ','.join('?' * len(seen)),
+                              seen).fetchone()[0] if seen else 0
+            print(f"  immich: {len(seen) - pend}/{len(seen)} of this run uploaded")
         if unreplicated_dupes:
             print(f"  {unreplicated_dupes} previously-imported file(s) still lacked a second copy")
         problems = []
@@ -638,11 +714,13 @@ def main() -> int:
             problems.append(f"{failed} file(s) rejected as damaged/truncated")
         if not replicated:
             problems.append("replication did not verify")
+        if not immich_ok:
+            problems.append("Immich upload failed (rerun to retry; the archive is unaffected)")
         if problems:
             print("\nPROBLEMS: " + "; ".join(problems))
         print("\nThis tool does not authorise erasing anything. Keep the card until you have "
               "confirmed the archive yourself.")
-        return 0 if (stage_ok and failed == 0 and replicated) else 1
+        return 0 if (stage_ok and failed == 0 and replicated and immich_ok) else 1
     finally:
         # Anything still staged is either an already-archived duplicate (safe to drop: its hash
         # is in the ledger and verified) or a rejected file worth inspecting. Keep the directory

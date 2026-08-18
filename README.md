@@ -18,7 +18,20 @@ names and camera-side state are not identity.
 --from-dir DIR           same pipeline from a mounted card or directory
 --seed-from DIR...       record files already held locally, so they are not re-fetched
 --from-camera --only-new fetch only entries the ledger lacks (see the caveat below)
+--immich [ALBUM]         additionally upload archived files to Immich
 ```
+
+With `--immich`, upload happens last and only for files already archived and verified, so Immich
+is a third destination rather than the only copy. Files group into `Camera YYYY-MM-DD` albums by
+capture day unless `ALBUM` names one. Credentials come from `IMMICH_INSTANCE_URL` and
+`IMMICH_API_KEY`, or from `~/.config/nikon-offload/immich.{url,key}`; an API key scoped to asset
+upload and album management is enough, and preferable to an admin key.
+
+Which files upload is decided by ledger state over the run's whole inventory, not by what was new
+in that run, so an upload that failed earlier is retried on the next offload of the same card
+rather than being skipped forever as a duplicate. A failed upload makes the run exit nonzero and
+leaves the archive untouched. Immich deduplicates by checksum, so re-running uploads nothing
+twice.
 
 Paths and the backup target come from the environment, so nothing host-specific is baked in:
 `NIKON_REMOTE` (or `--remote`) is the `host:path` for the verified second copy, `--archive` and

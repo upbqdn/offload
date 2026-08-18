@@ -1,0 +1,28 @@
+# Image data and derived output never belong in git.
+*.NEF
+*.NRW
+*.dng
+*.DNG
+*.jpg
+*.JPG
+*.jpeg
+*.tif
+*.tiff
+*.mov
+*.MOV
+*.mp4
+*.xmp
+*.npy
+
+# Working state
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+offload-*/
+probe-*/
+archive/
+eclipse/
+he-star*/
+lossless/
+.venv/
+__pycache__/

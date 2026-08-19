@@ -1,13 +1,13 @@
 # nikon
 
-Offload, verification and eclipse-processing tools for a Nikon Z6III.
+Offload, verification and eclipse-processing tools for a Nikon Z6III and a ZWO Seestar.
 
-Two unrelated jobs live here: getting files off the camera safely, and turning bracketed
-totality frames into something viewable.
+Two unrelated jobs live here: getting files off a camera or telescope safely, and turning
+bracketed totality frames into something viewable.
 
 ## Offload
 
-`nikon-offload.py` imports from the camera over USB PTP or from a mounted card, identifying every
+`offload.py` imports from the camera over USB PTP or from a mounted card, identifying every
 file by **content hash**, never by name. Nikon's `DSC_####` counter wraps at 9999 and can be reset
 in-camera, and the PTP "new file" flag does not survive card, camera and software changes, so
 names and camera-side state are not identity.
@@ -19,12 +19,35 @@ names and camera-side state are not identity.
 --seed-from DIR...       record files already held locally, so they are not re-fetched
 --from-camera --only-new fetch only entries the ledger lacks (see the caveat below)
 --immich [ALBUM]         additionally upload archived files to Immich
+--to-immich DIR          copy DIR to Immich and prove it arrived; writes no archive
+```
+
+## To Immich, with no archive
+
+`--to-immich DIR` is for when Immich is the destination of record rather than a third copy. It
+copies to a temporary directory, re-hashes to confirm the copy, runs the integrity gate, uploads,
+then asks Immich by SHA-1 whether it holds each file, and deletes the temporary copy only for
+those it confirms. No archive tree, and no ledger: Immich answers "already have this?" itself,
+so the mode keeps no state and re-running costs one checksum comparison per file.
+
+A checksum matching a **trashed** asset counts as absent. Immich blocks re-upload of a trashed
+duplicate, so treating it as present would lose the file when the trash empties.
+
+Staging survives for anything unconfirmed: integrity failures, upload failures, and formats
+Immich cannot render (FITS). Those are reported with their paths rather than discarded, since
+where they belong is not this tool's decision. The source is only ever read.
+
+A Seestar mounts as a plain exFAT disk, so it needs no protocol of its own:
+
+```
+udisksctl mount -b /dev/sda --options ro
+./offload.py --to-immich /run/media/$USER/Seestar/MyWorks --album "Seestar 2026-08-12"
 ```
 
 With `--immich`, upload happens last and only for files already archived and verified, so Immich
 is a third destination rather than the only copy. Files group into `Camera YYYY-MM-DD` albums by
 capture day unless `ALBUM` names one. Credentials come from `IMMICH_INSTANCE_URL` and
-`IMMICH_API_KEY`, or from `~/.config/nikon-offload/immich.{url,key}`; an API key scoped to asset
+`IMMICH_API_KEY`, or from `~/.config/offload/immich.{url,key}`; an API key scoped to asset
 upload and album management is enough, and preferable to an admin key.
 
 Which files upload is decided by ledger state over the run's whole inventory, not by what was new

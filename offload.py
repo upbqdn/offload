@@ -31,18 +31,25 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import hashlib
+import json
 import os
 import shutil
 import sqlite3
+import struct
 import subprocess
 import sys
 import tempfile
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 RAW_EXT = {'.nef', '.nrw'}
 JPEG_EXT = {'.jpg', '.jpeg'}
-VIDEO_EXT = {'.mov', '.mp4'}
-WANTED = RAW_EXT | JPEG_EXT | VIDEO_EXT
+VIDEO_EXT = {'.mov', '.mp4', '.avi'}
+# Formats Immich cannot render. Never uploaded, never silently discarded: the run reports them
+# and keeps them staged, because a destination for them is a decision the operator has to make.
+OPAQUE_EXT = {'.fit', '.fits'}
+WANTED = RAW_EXT | JPEG_EXT | VIDEO_EXT | OPAQUE_EXT
 CHUNK = 4 << 20
 
 
@@ -150,6 +157,8 @@ def integrity_ok(path: Path) -> tuple[bool, str]:
         return (True, '') if tiff_extent_ok(path) else (False, 'raw data past EOF (truncated?)')
     if ext in JPEG_EXT:
         return (True, '') if jpeg_ok(path) else (False, 'missing JPEG end marker (truncated?)')
+    if ext in {'.mp4', '.mov'}:
+        return (True, '') if mp4_ok(path) else (False, 'box extends past EOF or no moov/mdat')
     return True, 'unchecked'
 
 def sha(path: Path) -> str:
@@ -323,17 +332,89 @@ def probe_one(session: Path) -> int:
     return 0 if ok else 1
 
 
+def mp4_ok(path: Path) -> bool:
+    """Every top-level box must lie wholly inside the file, and moov/mdat must both exist.
+
+    Same principle as the TIFF gate: positive proof of extent, not absence of evidence. An
+    interrupted copy leaves a final box declaring more bytes than the file holds, and a file
+    missing `moov` carries no index even if its bytes are all present.
+    """
+    size = path.stat().st_size
+    seen: set[bytes] = set()
+    pos = 0
+    with path.open('rb') as fh:
+        while pos < size:
+            head = fh.read(8)
+            if len(head) < 8:
+                return False                     # truncated mid-header
+            box, typ = struct.unpack('>I4s', head)
+            if box == 1:                         # 64-bit largesize follows
+                ext = fh.read(8)
+                if len(ext) < 8:
+                    return False
+                box = struct.unpack('>Q', ext)[0]
+            elif box == 0:                       # extends to EOF; only valid as the last box
+                seen.add(typ)
+                return {b'moov', b'mdat'} <= seen
+            if box < 8 or pos + box > size:      # declares bytes the file does not have
+                return False
+            seen.add(typ)
+            pos += box
+            fh.seek(pos)
+    return {b'moov', b'mdat'} <= seen
+
+
+def immich_present(files: list[Path]) -> dict[Path, tuple[bool, str]]:
+    """Ask Immich which files it already holds, by SHA-1, via bulk-upload-check.
+
+    Returns path -> (present_and_live, note). A checksum matching a *trashed* asset counts as
+    absent: Immich blocks re-upload of a trashed duplicate, and the asset disappears when the
+    trash is emptied, so treating it as present loses the file silently.
+    """
+    url, key = immich_creds()
+    if not url or not key:
+        return {p: (False, 'no credentials') for p in files}
+    sums = {p: hashlib.sha1(p.read_bytes()).hexdigest() for p in files}
+    body = json.dumps({'assets': [{'id': str(p), 'checksum': s} for p, s in sums.items()]})
+    req = urllib.request.Request(f'{url}/assets/bulk-upload-check', data=body.encode(),
+                                 headers={'x-api-key': key, 'Content-Type': 'application/json'})
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            results = json.load(r)['results']
+    except (urllib.error.URLError, OSError, KeyError, ValueError) as exc:
+        return {p: (False, f'check failed: {exc}') for p in files}
+    out: dict[Path, tuple[bool, str]] = {}
+    for res in results:
+        p = Path(res['id'])
+        if res.get('action') == 'reject' and res.get('reason') == 'duplicate':
+            trashed = res.get('isTrashed', False)
+            out[p] = (not trashed, 'in trash - would vanish with it' if trashed else 'present')
+        else:
+            out[p] = (False, 'absent')
+    return out
+
+
+def immich_creds() -> tuple[str, str]:
+    """Instance URL and API key from the environment or ~/.config/offload/."""
+    cfg = Path.home() / '.config/offload'
+    url = os.environ.get('IMMICH_INSTANCE_URL') or (
+        (cfg / 'immich.url').read_text().strip() if (cfg / 'immich.url').exists() else '')
+    key = os.environ.get('IMMICH_API_KEY') or (
+        (cfg / 'immich.key').read_text().strip() if (cfg / 'immich.key').exists() else '')
+    return url, key
+
+
 def immich_upload(files: list[Path], album: str) -> bool:
     """Upload freshly archived files to Immich via its official CLI.
 
     Runs only after the files are archived and verified, so Immich is an additional
     destination rather than the only copy. Credentials come from the environment or
-    ~/.config/nikon-offload/immich.{url,key}; use an API key scoped to asset upload
+    ~/.config/offload/immich.{url,key}; use an API key scoped to asset upload
     and album management, not an admin key.
 
     Immich deduplicates by checksum, so re-running is harmless.
     """
-    cfg = Path.home() / '.config/nikon-offload'
+    cfg = Path.home() / '.config/offload'
     url = os.environ.get('IMMICH_INSTANCE_URL') or (
         (cfg / 'immich.url').read_text().strip() if (cfg / 'immich.url').exists() else '')
     key = os.environ.get('IMMICH_API_KEY') or (
@@ -352,6 +433,91 @@ def immich_upload(files: list[Path], album: str) -> bool:
         print(f'  ! Immich upload exited {proc.returncode}', file=sys.stderr)
         return False
     return True
+
+
+def to_immich(source: Path, album: str, keep: bool) -> int:
+    """Copy from `source` to a temporary directory, verify, upload to Immich, prove Immich has
+    each file, then delete the temporary copy.
+
+    No archive tree is written, and `source` is only ever read. Immich itself answers "do you
+    already have this?" by checksum, so the mode keeps no state of its own and re-running is
+    cheap and safe.
+
+    Staging survives for exactly those files Immich did not confirm: anything that failed the
+    integrity gate, anything Immich rejected, and any format Immich cannot render. Those are
+    reported with their paths rather than deleted, because discarding a file Immich never took
+    would lose it.
+    """
+    session = Path(tempfile.mkdtemp(prefix='to-immich-'))
+    print(f"staging in {session}")
+    found = sorted(p for p in source.rglob('*') if p.is_file() and p.suffix.lower() in WANTED)
+    if not found:
+        print(f"no files with known extensions under {source}")
+        shutil.rmtree(session, ignore_errors=True)
+        return 1
+    print(f"found {len(found)} file(s) under {source}")
+
+    staged: list[Path] = []
+    damaged: list[tuple[Path, str]] = []
+    for src in found:
+        # Mirror the source layout. Seestar keeps one folder per target and reuses filenames
+        # inside them, so flattening would let one target's file overwrite another's.
+        dst = session / src.relative_to(source)
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dst)
+        if sha(dst) != sha(src):
+            damaged.append((dst, 'copy did not match the source hash'))
+            continue
+        ok, why = integrity_ok(dst)
+        if not ok:
+            damaged.append((dst, why))
+            continue
+        staged.append(dst)
+    for path, why in damaged:
+        print(f"  ! {path.relative_to(session)}: {why}", file=sys.stderr)
+
+    opaque = [p for p in staged if p.suffix.lower() in OPAQUE_EXT]
+    renderable = [p for p in staged if p.suffix.lower() not in OPAQUE_EXT]
+
+    before = immich_present(renderable)
+    todo = [p for p in renderable if not before[p][0]]
+    for p in renderable:
+        rel = p.relative_to(session)
+        if before[p][0]:
+            print(f"  = {rel}: already in Immich")
+        elif before[p][1] != 'absent':
+            print(f"  ~ {rel}: {before[p][1]}")
+    if todo:
+        print(f"  uploading {len(todo)} file(s) to '{album}'")
+        immich_upload(todo, album)
+
+    after = immich_present(renderable)
+    confirmed = [p for p in renderable if after[p][0]]
+    missing = [p for p in renderable if not after[p][0]]
+
+    print(f"\nconfirmed in Immich by checksum: {len(confirmed)}/{len(renderable)}")
+    for p in missing:
+        print(f"  ! not in Immich: {p.relative_to(session)} ({after[p][1]})", file=sys.stderr)
+    if opaque:
+        print(f"  {len(opaque)} file(s) Immich cannot render, left staged:")
+        for p in opaque:
+            print(f"    {p}")
+
+    if keep:
+        print(f"\nstaging kept at {session}")
+    else:
+        for p in confirmed:
+            p.unlink()
+        leftover = [p for p in session.rglob('*') if p.is_file()]
+        if leftover:
+            print(f"\n{len(leftover)} unconfirmed file(s) kept at {session}")
+        else:
+            shutil.rmtree(session, ignore_errors=True)
+            print("\nstaging removed: every file is verified present in Immich")
+
+    print("\nThis tool never writes to or erases the source. Delete from the device yourself, "
+          "once you are satisfied.")
+    return 0 if (not damaged and not missing and not opaque) else 1
 
 
 def stage_from_camera(session: Path) -> tuple[list[Path], bool]:
@@ -543,6 +709,11 @@ def main() -> int:
                      help='download ONE file and verify it round-trips; no archive, no ledger')
     src.add_argument('--seed-from', type=Path, nargs='+', metavar='DIR',
                      help='record existing local originals as already-held (hashes, moves nothing)')
+    src.add_argument('--to-immich', type=Path, metavar='DIR',
+                     help='copy DIR to Immich and prove it arrived, writing no archive; for '
+                          'devices that mount as a disk, e.g. a Seestar')
+    ap.add_argument('--album', default='',
+                    help='with --to-immich, the album name; defaults to the source folder name')
     ap.add_argument('--only-new', action='store_true',
                     help='with --from-camera, fetch only entries the ledger lacks (name+KB match, '
                          'weaker than hashing - see stage_only_new docstring)')
@@ -558,6 +729,12 @@ def main() -> int:
                          '"Camera YYYY-MM-DD" per capture day')
     ap.add_argument('--keep-session', action='store_true', help='do not delete the staging dir')
     a = ap.parse_args()
+
+    # Archive-free path: no ledger, because Immich answers "already have it?" by checksum.
+    if a.to_immich:
+        if not a.to_immich.is_dir():
+            raise SystemExit(f'not a directory: {a.to_immich}')
+        return to_immich(a.to_immich, a.album or f'Seestar {a.to_immich.name}', a.keep_session)
 
     db = db_open(a.ledger)
     if a.probe_one:

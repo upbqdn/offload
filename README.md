@@ -1,4 +1,4 @@
-# nikon
+# offload
 
 Offload, verification and eclipse-processing tools for a Nikon Z6III and a ZWO Seestar.
 

@@ -43,13 +43,19 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-RAW_EXT = {'.nef', '.nrw'}
+RAW_EXT = {'.nef', '.nrw', '.dng'}
 JPEG_EXT = {'.jpg', '.jpeg'}
 VIDEO_EXT = {'.mov', '.mp4', '.avi'}
-# Formats Immich cannot render. Never uploaded, never silently discarded: the run reports them
-# and keeps them staged, because a destination for them is a decision the operator has to make.
-OPAQUE_EXT = {'.fit', '.fits'}
-WANTED = RAW_EXT | JPEG_EXT | VIDEO_EXT | OPAQUE_EXT
+FITS_EXT = {'.fit', '.fits'}
+WANTED = RAW_EXT | JPEG_EXT | VIDEO_EXT | FITS_EXT
+# What Immich renders faithfully, and therefore all it may be sent.
+#
+# Raw is deliberately excluded even though Immich accepts it. Immich develops raw with libraw's
+# auto-brightness, which normalises each frame's own histogram: a deliberately dark frame comes
+# back stretched to full range with its noise floor amplified. Measured on DSC_0295.dng, a -4 EV
+# corona exposure, mean luma went from 0.61 in the camera JPEG to 38.39 - so what Immich shows is
+# not the photograph, and judging or culling by it is misleading. FITS it cannot read at all.
+IMMICH_EXT = JPEG_EXT | VIDEO_EXT | {'.png', '.heic', '.heif', '.webp'}
 CHUNK = 4 << 20
 
 
@@ -476,8 +482,8 @@ def to_immich(source: Path, album: str, keep: bool) -> int:
     for path, why in damaged:
         print(f"  ! {path.relative_to(session)}: {why}", file=sys.stderr)
 
-    opaque = [p for p in staged if p.suffix.lower() in OPAQUE_EXT]
-    renderable = [p for p in staged if p.suffix.lower() not in OPAQUE_EXT]
+    held = [p for p in staged if p.suffix.lower() not in IMMICH_EXT]
+    renderable = [p for p in staged if p.suffix.lower() in IMMICH_EXT]
 
     before = immich_present(renderable)
     todo = [p for p in renderable if not before[p][0]]
@@ -498,9 +504,9 @@ def to_immich(source: Path, album: str, keep: bool) -> int:
     print(f"\nconfirmed in Immich by checksum: {len(confirmed)}/{len(renderable)}")
     for p in missing:
         print(f"  ! not in Immich: {p.relative_to(session)} ({after[p][1]})", file=sys.stderr)
-    if opaque:
-        print(f"  {len(opaque)} file(s) Immich cannot render, left staged:")
-        for p in opaque:
+    if held:
+        print(f"  {len(held)} file(s) not sent to Immich (raw or FITS), left staged:")
+        for p in held:
             print(f"    {p}")
 
     if keep:
@@ -517,7 +523,7 @@ def to_immich(source: Path, album: str, keep: bool) -> int:
 
     print("\nThis tool never writes to or erases the source. Delete from the device yourself, "
           "once you are satisfied.")
-    return 0 if (not damaged and not missing and not opaque) else 1
+    return 0 if (not damaged and not missing and not held) else 1
 
 
 def stage_from_camera(session: Path) -> tuple[list[Path], bool]:
@@ -837,16 +843,30 @@ def main() -> int:
         # over this run's whole inventory, not by what happened to be new this run: an upload
         # that failed earlier is retried on the next offload of the same card. Grouped by
         # capture day so albums stay useful.
+        #
+        # Only IMMICH_EXT is sent. Raw stays local: Immich would render it with auto-brightness
+        # and misrepresent the exposure, so the JPEG is the viewing copy and the raw is the
+        # negative. Rows for raw are marked uploaded so they are not retried forever.
         immich_ok = True
         if a.immich:
             todo: dict[str, list[Path]] = {}
+            skipped = 0
             for digest in seen:
                 row = db.execute('SELECT local_path FROM asset WHERE content_hash=? '
                                  'AND immich_uploaded=0', (digest,)).fetchone()
-                if row and Path(row[0]).exists():
-                    todo.setdefault(Path(row[0]).parent.name, []).append(Path(row[0]))
+                if not row or not Path(row[0]).exists():
+                    continue
+                path = Path(row[0])
+                if path.suffix.lower() not in IMMICH_EXT:
+                    db.execute('UPDATE asset SET immich_uploaded=1 WHERE local_path=?', (row[0],))
+                    skipped += 1
+                    continue
+                todo.setdefault(path.parent.name, []).append(path)
+            db.commit()
+            if skipped:
+                print(f"  immich: {skipped} raw/FITS file(s) kept local, not uploaded")
             if not todo:
-                print('  immich: already uploaded, nothing to do')
+                print('  immich: nothing new to upload')
             for day, paths in sorted(todo.items()):
                 album = f'Camera {day}' if a.immich == 'auto' else a.immich
                 print(f"  immich: uploading {len(paths)} file(s) to '{album}'")
@@ -876,10 +896,11 @@ def main() -> int:
         for ext, (vl, vr) in sorted(by_ext.items()):
             print(f"  archive {ext:>5}: {vl} local-verified, {vr} remote-verified")
         if a.immich:
-            pend = db.execute('SELECT COUNT(*) FROM asset WHERE immich_uploaded=0 AND '
-                              'content_hash IN (%s)' % ','.join('?' * len(seen)),
-                              seen).fetchone()[0] if seen else 0
-            print(f"  immich: {len(seen) - pend}/{len(seen)} of this run uploaded")
+            local_only = sum(1 for d in seen
+                             if (r := db.execute('SELECT local_path FROM asset WHERE '
+                                                 'content_hash=?', (d,)).fetchone())
+                             and Path(r[0]).suffix.lower() not in IMMICH_EXT)
+            print(f"  immich: {len(seen) - local_only} uploaded, {local_only} kept local (raw)")
         if unreplicated_dupes:
             print(f"  {unreplicated_dupes} previously-imported file(s) still lacked a second copy")
         problems = []
@@ -889,7 +910,9 @@ def main() -> int:
             problems.append("nothing was staged, so the source was never read")
         if failed:
             problems.append(f"{failed} file(s) rejected as damaged/truncated")
-        if not replicated:
+        # No remote configured is a choice, not a failure. The run already says a single copy
+        # exists; failing every run's exit status for it would train the operator to ignore it.
+        if a.remote and not replicated:
             problems.append("replication did not verify")
         if not immich_ok:
             problems.append("Immich upload failed (rerun to retry; the archive is unaffected)")
@@ -897,7 +920,8 @@ def main() -> int:
             print("\nPROBLEMS: " + "; ".join(problems))
         print("\nThis tool does not authorise erasing anything. Keep the card until you have "
               "confirmed the archive yourself.")
-        return 0 if (stage_ok and failed == 0 and replicated and immich_ok) else 1
+        return 0 if (stage_ok and failed == 0 and (replicated or not a.remote)
+                     and immich_ok) else 1
     finally:
         # Anything still staged is either an already-archived duplicate (safe to drop: its hash
         # is in the ledger and verified) or a rejected file worth inspecting. Keep the directory
